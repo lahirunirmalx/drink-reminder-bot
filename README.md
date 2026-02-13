@@ -1,36 +1,137 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Water Drinking Reminder Bot for Google Chat
 
-## Getting Started
+A simple, reliable chatbot that posts random water drinking reminders to Google Chat spaces at random intervals (15-30 minutes).
 
-First, run the development server:
+## Architecture
+
+This bot uses:
+- **Netlify Functions** for serverless execution
+- **Google Chat Incoming Webhooks** for posting messages
+- **External cron service** for scheduling (recommended) or Netlify Scheduled Functions
+
+No databases, no state management, no complexity. Just a function that posts messages when called.
+
+## Setup
+
+### 1. Install Dependencies
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+### 2. Configure Environment Variables
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Create a `.env` file in the root directory:
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+# Google Chat Webhook URL
+GOOGLE_CHAT_WEBHOOK_URL=https://chat.googleapis.com/v1/spaces/SPACE_ID/messages?key=KEY&token=TOKEN
 
-## Learn More
+# Optional: Secret key for securing the endpoint
+SECRET_KEY=your-secret-key-here
+```
 
-To learn more about Next.js, take a look at the following resources:
+**Getting your Google Chat Webhook URL:**
+1. Open your Google Chat space
+2. Click on the space name → **Apps and integrations**
+3. Click **Manage webhooks**
+4. Create a new webhook or use an existing one
+5. Copy the webhook URL to your `.env` file
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### 3. Deploy to Netlify
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+1. Push your code to GitHub/GitLab
+2. Connect your repository to Netlify
+3. In Netlify dashboard, go to **Site settings** → **Environment variables**
+4. Add your environment variables:
+   - `GOOGLE_CHAT_WEBHOOK_URL`
+   - `SECRET_KEY` (optional but recommended)
 
-## Deploy on Vercel
+5. Deploy the site
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+### 4. Set Up Scheduling
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+For random intervals (15-30 minutes), use an external cron service:
+
+#### Option A: Using cron-job.org (Free)
+
+1. Sign up at [cron-job.org](https://cron-job.org)
+2. Create a new cron job:
+   - **URL**: `https://your-site.netlify.app/.netlify/functions/post-reminder?key=your-secret-key`
+   - **Schedule**: Set multiple cron jobs with different intervals (15, 18, 20, 22, 25, 28, 30 minutes)
+   - **Method**: GET or POST
+
+#### Option B: Using EasyCron
+
+1. Sign up at [EasyCron](https://www.easycron.com)
+2. Create cron jobs with random intervals between 15-30 minutes
+
+#### Option C: Using Netlify Scheduled Functions (Pro/Business Plan)
+
+If you have Netlify Pro/Business, you can use scheduled functions. Add to `netlify.toml`:
+
+```toml
+[[plugins]]
+  package = "@netlify/plugin-scheduled-functions"
+
+[functions]
+  node_bundler = "esbuild"
+```
+
+Then create a scheduled function that calls the reminder function.
+
+## Testing Locally
+
+1. Install Netlify CLI:
+```bash
+npm install -g netlify-cli
+```
+
+2. Start local development:
+```bash
+netlify dev
+```
+
+3. Test the function:
+```bash
+curl -X POST http://localhost:8888/.netlify/functions/post-reminder
+```
+
+## Function Endpoint
+
+Once deployed, your function will be available at:
+```
+https://your-site.netlify.app/.netlify/functions/post-reminder
+```
+
+With optional secret key:
+```
+https://your-site.netlify.app/.netlify/functions/post-reminder?key=your-secret-key
+```
+
+## How It Works
+
+1. External cron service calls the Netlify function at random intervals (15-30 mins)
+2. Function selects a random reminder message from the pool
+3. Function posts the message to Google Chat via webhook
+4. Google Chat displays the reminder in the space
+
+## Customization
+
+### Adding More Reminder Messages
+
+Edit `lib/messages.ts` and add more messages to the `REMINDER_MESSAGES` array.
+
+### Changing Interval Range
+
+Adjust your cron job schedules to match your desired interval range.
+
+## Troubleshooting
+
+- **Function returns 500**: Check that `GOOGLE_CHAT_WEBHOOK_URL` is set correctly
+- **Messages not appearing**: Verify the webhook URL is valid and the webhook is enabled in Google Chat
+- **Unauthorized errors**: Make sure the `SECRET_KEY` matches if you're using it
+
+## License
+
+MIT
