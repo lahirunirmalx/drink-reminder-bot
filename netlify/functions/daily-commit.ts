@@ -199,7 +199,8 @@ export const handler: Handler = async (event) => {
     };
   }
 
-  const tz = (process.env.TZ ?? 'UTC').trim();
+  let tz = (process.env.TZ ?? 'UTC').trim().replace(/^:/, '');
+  if (tz === '') tz = 'UTC';
   const now = new Date();
   const formatter = new Intl.DateTimeFormat('en-CA', {
     timeZone: tz,
