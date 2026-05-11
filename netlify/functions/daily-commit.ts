@@ -1,50 +1,145 @@
 import { Handler } from '@netlify/functions';
 
 /**
- * Daily commit + auto-repo workflow (tuned to fit Netlify's default 10s timeout).
+ * Daily commit + side-repo workflow (tuned to fit Netlify's default 10s timeout).
  *
  * Each run:
- *  1. Creates 1..MAX_AUTO_REPOS brand-new repos under GITHUB_TOKEN's user
- *     (prefix `auto-daily-`), in parallel. For each repo:
+ *  1. Creates 1..MAX_NEW_REPOS_PER_RUN brand-new repos under GITHUB_TOKEN's
+ *     user, in parallel. Repo names use random tech-word combos so they look
+ *     organic. For each repo:
  *       - invites GITHUB_APPROVER_TOKEN's user as collaborator (`push`)
  *       - approver auto-accepts the invitation
- *       - pushes a file via PR
+ *       - commits a realistic-looking file via PR (README/notes/CHANGELOG/TODO)
  *       - approver leaves an APPROVE review
  *       - owner merges the PR
- *       - opens 1..MAX_ISSUES_PER_REPO issues (parallel)
- *     If GITHUB_APPROVER_TOKEN is missing, collaborator + approve steps are
- *     skipped (the PR still merges).
- *  2. On weekday WEEKLY_CLEANUP_WEEKDAY (in TZ): lists `auto-daily-` repos
- *     >2 days old and randomly deletes ~half.
- *  3. Commits `daily/<time>.txt` (unchanged) + `registry/<time>.json` (audit
- *     log with repo names, PR numbers, approval/merge status, issues, cleanup
- *     results) to GITHUB_REPO in one branch, opens PR, merges yesterday's
- *     still-open PRs.
+ *       - opens 1..MAX_ISSUES_PER_REPO issues with realistic titles (parallel)
+ *  2. On WEEKLY_CLEANUP_WEEKDAY (in TZ): reads the cumulative registry from
+ *     the main repo, picks entries older than 2 days, randomly deletes ~half.
+ *  3. Commits to GITHUB_REPO in one branch:
+ *       - daily/<time>.txt        (existing daily file, unchanged format)
+ *       - registry/<time>.json    (per-run audit log)
+ *       - registry/index.json     (cumulative repo list for cleanup)
+ *     Opens PR to default branch, merges yesterday's still-open PRs.
  *
  * Env:
  *   GITHUB_REPO            owner/repo of the main tracking repo (required)
  *   GITHUB_TOKEN           owner PAT, scopes: repo, delete_repo (required)
- *   GITHUB_APPROVER_TOKEN  separate-bot PAT, scope: repo (optional). When set,
- *                          PRs in auto repos receive a real APPROVE review.
+ *   GITHUB_APPROVER_TOKEN  separate-bot PAT, scope: repo (optional)
  *   SECRET_KEY             optional auth key (query ?key= or body.key)
  *   TZ                     optional IANA tz (default UTC)
- *
- * Sizing: MAX_AUTO_REPOS = 3 keeps total runtime well under 10s with parallel
- * workflows. Raise it only if you switch the file to a Netlify Background
- * Function (rename to `daily-commit-background.ts`, 15min limit).
  */
 
 const GITHUB_API = 'https://api.github.com';
-const AUTO_REPO_PREFIX = 'auto-daily-';
-const MIN_AUTO_REPOS = 1;
-const MAX_AUTO_REPOS = 3;
+const MIN_NEW_REPOS_PER_RUN = 1;
+const MAX_NEW_REPOS_PER_RUN = 3;
 const MIN_ISSUES_PER_REPO = 1;
 const MAX_ISSUES_PER_REPO = 5;
 const WEEKLY_CLEANUP_WEEKDAY = 'Sun';
 const REPO_AGE_DAYS_BEFORE_DELETE = 2;
 const DELETE_PROBABILITY = 0.5;
+const REGISTRY_INDEX_PATH = 'registry/index.json';
+
+const TECH_WORDS = [
+  'api', 'sdk', 'core', 'util', 'engine', 'parser', 'runner', 'broker',
+  'bridge', 'sync', 'queue', 'cache', 'mesh', 'vault', 'gateway', 'registry',
+  'kernel', 'proxy', 'agent', 'daemon', 'scheduler', 'dispatcher', 'monitor',
+  'tracker', 'listener', 'handler', 'emitter', 'processor', 'validator',
+  'adapter', 'loader', 'packer', 'indexer', 'mapper', 'builder', 'compiler',
+  'linter', 'fetcher', 'sampler', 'profiler', 'lambda', 'pulse', 'beacon',
+  'forge', 'sphere', 'orbit', 'flux', 'pixel', 'nano', 'micro', 'cluster',
+  'spool', 'shard', 'pipeline', 'stream', 'buffer', 'router', 'resolver',
+  'crawler', 'analyzer', 'gauge', 'rune', 'spark', 'echo', 'helix',
+];
+
+const PR_TITLES = [
+  'Initial setup', 'Add base config', 'Bootstrap module', 'Wire up scaffolding',
+  'Update docs', 'Add readme details', 'Configure defaults', 'Add example config',
+  'Tweak settings', 'Refactor structure', 'Tidy up', 'Polish notes',
+  'Cleanup formatting', 'Initial commit',
+];
+
+const COMMIT_MESSAGES = [
+  'Initial setup', 'Bootstrap config', 'Add scaffolding', 'Wire defaults',
+  'Update docs', 'Tweak readme', 'Add example', 'Refactor structure',
+  'Polish notes', 'Cleanup formatting',
+];
+
+const ISSUE_TITLES = [
+  'Add unit tests', 'Document API surface', 'Set up CI pipeline',
+  'Review caching strategy', 'Optimize startup time', 'Add error handling',
+  'Improve logging', 'Add metrics', 'Refactor module structure',
+  'Update dependencies', 'Add config validation', 'Improve docs',
+  'Add integration tests', 'Profile memory usage', 'Add rate limiting',
+  'Investigate flaky test', 'Reduce memory footprint', 'Add health check',
+];
+
+const BRANCH_PREFIXES = ['feature', 'update', 'chore', 'fix', 'refactor'];
+const BRANCH_TOPICS = ['setup', 'config', 'docs', 'cleanup', 'notes', 'init', 'scaffold'];
+
+const REVIEW_BODIES = ['LGTM', 'Looks good', 'Approved', 'Ship it', ''];
+
+const REPO_DESCRIPTIONS = [
+  '', 'Service prototype', 'Personal sandbox', 'Scratch project', 'Side project',
+  'WIP module', 'Experimental tooling', 'Internal helper',
+];
+
+const README_DESCRIPTIONS = [
+  'Personal scratch space.',
+  'Service prototype, work in progress.',
+  'Experimental module — not yet stable.',
+  'Internal tooling, draft.',
+  'Side project notes.',
+  'Quick prototype for an idea.',
+];
 
 type GitHubApiResult = Record<string, unknown> | Record<string, unknown>[] | null;
+
+function pickRandom<T>(arr: T[]): T {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function randomDigits(n: number): string {
+  const min = Math.pow(10, n - 1);
+  const max = Math.pow(10, n) - 1;
+  return String(Math.floor(min + Math.random() * (max - min + 1)));
+}
+
+function generateRepoName(): string {
+  const w1 = pickRandom(TECH_WORDS);
+  let w2 = pickRandom(TECH_WORDS);
+  while (w2 === w1) w2 = pickRandom(TECH_WORDS);
+  return `${w1}-${w2}-${randomDigits(6)}`;
+}
+
+function generateBranchName(): string {
+  return `${pickRandom(BRANCH_PREFIXES)}/${pickRandom(BRANCH_TOPICS)}-${randomDigits(3)}`;
+}
+
+function generateFileChange(repoName: string): { path: string; content: string } {
+  const choice = Math.floor(Math.random() * 4);
+  switch (choice) {
+    case 0:
+      return {
+        path: 'README.md',
+        content: `# ${repoName}\n\n${pickRandom(README_DESCRIPTIONS)}\n`,
+      };
+    case 1:
+      return {
+        path: 'notes.md',
+        content: `# Notes\n\n${pickRandom(README_DESCRIPTIONS)}\n\n- ${pickRandom(ISSUE_TITLES)}\n- ${pickRandom(ISSUE_TITLES)}\n`,
+      };
+    case 2:
+      return {
+        path: 'CHANGELOG.md',
+        content: `## Unreleased\n\n- ${pickRandom(COMMIT_MESSAGES)}\n- ${pickRandom(COMMIT_MESSAGES)}\n`,
+      };
+    default:
+      return {
+        path: 'TODO.md',
+        content: `# TODO\n\n- ${pickRandom(ISSUE_TITLES)}\n- ${pickRandom(ISSUE_TITLES)}\n- ${pickRandom(ISSUE_TITLES)}\n`,
+      };
+  }
+}
 
 async function githubRequest(
   token: string,
@@ -221,18 +316,18 @@ function filterPrsByDate(
   return result;
 }
 
-interface AutoRepoCreation {
+interface NewRepo {
   name: string;
   full_name: string;
   default_branch: string;
 }
 
-async function createAutoRepo(token: string, name: string, today: string): Promise<AutoRepoCreation | null> {
+async function createNewRepo(token: string, name: string): Promise<NewRepo | null> {
   const res = await githubRequest(token, 'POST', '/user/repos', {
     name,
     auto_init: true,
     private: false,
-    description: `Auto-created on ${today}`,
+    description: pickRandom(REPO_DESCRIPTIONS),
   });
   if (!res || typeof res !== 'object' || Array.isArray(res)) return null;
   const r = res as { full_name?: string; name?: string; default_branch?: string };
@@ -300,13 +395,10 @@ interface RepoActivity {
   issues: number[];
 }
 
-async function runAutoRepoWorkflow(
+async function runNewRepoWorkflow(
   ownerToken: string,
   approver: Approver | null,
-  fullName: string,
-  defaultBranch: string,
-  branchName: string,
-  fileContent: string,
+  repo: NewRepo,
   numIssues: number
 ): Promise<Omit<RepoActivity, 'name' | 'full_name' | 'creation_status'>> {
   let collaboratorStatus: CollaboratorStatus = 'skipped';
@@ -316,44 +408,48 @@ async function runAutoRepoWorkflow(
   let issues: number[] = [];
 
   if (approver) {
-    const inv = await inviteCollaborator(fullName, ownerToken, approver.username);
+    const inv = await inviteCollaborator(repo.full_name, ownerToken, approver.username);
     collaboratorStatus = inv.status;
     if (inv.status === 'invited' && inv.invitationId !== null) {
       await acceptInvitation(approver.token, inv.invitationId);
     }
   }
 
-  const base = await getBranchCommitAndTree(fullName, ownerToken, defaultBranch);
+  const base = await getBranchCommitAndTree(repo.full_name, ownerToken, repo.default_branch);
   if (base) {
+    const branchName = generateBranchName();
+    const file = generateFileChange(repo.name);
+    const commitMessage = pickRandom(COMMIT_MESSAGES);
     const created = await createBranchWithFiles(
-      fullName,
+      repo.full_name,
       ownerToken,
       branchName,
-      [{ path: 'auto-update.txt', content: fileContent }],
-      'Auto update',
+      [file],
+      commitMessage,
       base.commitSha,
       base.treeSha
     );
     if (created) {
-      const prRes = await githubApi(fullName, ownerToken, 'POST', '/pulls', {
-        title: 'Auto PR',
+      const prTitle = pickRandom(PR_TITLES);
+      const prRes = await githubApi(repo.full_name, ownerToken, 'POST', '/pulls', {
+        title: prTitle,
         head: branchName,
-        base: defaultBranch,
-        body: 'Auto-generated PR from daily-commit function',
+        base: repo.default_branch,
+        body: prTitle,
       });
       if (prRes && typeof prRes === 'object' && !Array.isArray(prRes)) {
         const n = (prRes as { number?: number }).number;
         if (typeof n === 'number') {
           prNumber = n;
           if (approver && collaboratorStatus !== 'failed') {
-            const reviewRes = await githubApi(fullName, approver.token, 'POST', `/pulls/${n}/reviews`, {
+            const reviewRes = await githubApi(repo.full_name, approver.token, 'POST', `/pulls/${n}/reviews`, {
               event: 'APPROVE',
-              body: 'Auto-approved',
+              body: pickRandom(REVIEW_BODIES),
             });
             prApproved = reviewRes !== null;
           }
-          const mergeRes = await githubApi(fullName, ownerToken, 'PUT', `/pulls/${n}/merge`, {
-            commit_title: `Auto merge PR #${n}`,
+          const mergeRes = await githubApi(repo.full_name, ownerToken, 'PUT', `/pulls/${n}/merge`, {
+            commit_title: `${prTitle} (#${n})`,
           });
           prMerged = mergeRes !== null;
         }
@@ -362,10 +458,10 @@ async function runAutoRepoWorkflow(
   }
 
   const issueResults = await Promise.all(
-    Array.from({ length: numIssues }, (_, i) =>
-      githubApi(fullName, ownerToken, 'POST', '/issues', {
-        title: `Auto task #${i + 1}`,
-        body: `Auto-generated issue ${i + 1} of ${numIssues}.`,
+    Array.from({ length: numIssues }, () =>
+      githubApi(repo.full_name, ownerToken, 'POST', '/issues', {
+        title: pickRandom(ISSUE_TITLES),
+        body: '',
       })
     )
   );
@@ -376,39 +472,36 @@ async function runAutoRepoWorkflow(
   return { collaborator_status: collaboratorStatus, pr_number: prNumber, pr_approved: prApproved, pr_merged: prMerged, issues };
 }
 
-interface AutoRepoInfo {
+interface RegistryEntry {
   full_name: string;
   name: string;
   created_at: string;
 }
 
-async function listOwnedAutoRepos(token: string, prefix: string): Promise<AutoRepoInfo[]> {
-  const all: AutoRepoInfo[] = [];
-  let page = 1;
-  const perPage = 100;
-  for (;;) {
-    const res = await githubRequest(
-      token,
-      'GET',
-      `/user/repos?per_page=${perPage}&page=${page}&affiliation=owner&sort=created&direction=asc`
-    );
-    if (!Array.isArray(res)) break;
-    for (const r of res) {
-      if (!r || typeof r !== 'object') continue;
-      const obj = r as { name?: string; full_name?: string; created_at?: string };
-      if (
-        typeof obj.name === 'string' &&
-        typeof obj.full_name === 'string' &&
-        typeof obj.created_at === 'string' &&
-        obj.name.startsWith(prefix)
-      ) {
-        all.push({ name: obj.name, full_name: obj.full_name, created_at: obj.created_at });
-      }
+interface RegistryRead {
+  entries: RegistryEntry[];
+  loaded: boolean;
+}
+
+async function readRegistryIndex(repo: string, token: string, branch: string): Promise<RegistryRead> {
+  const res = await githubApi(repo, token, 'GET', `/contents/${REGISTRY_INDEX_PATH}?ref=${encodeURIComponent(branch)}`);
+  if (!res || typeof res !== 'object' || Array.isArray(res)) return { entries: [], loaded: false };
+  const obj = res as { content?: string; encoding?: string };
+  if (!obj.content) return { entries: [], loaded: true };
+  try {
+    const decoded = Buffer.from(obj.content, (obj.encoding as BufferEncoding) || 'base64').toString('utf8');
+    const parsed = JSON.parse(decoded);
+    if (Array.isArray(parsed)) {
+      const entries = parsed.filter(
+        (e): e is RegistryEntry =>
+          e && typeof e === 'object' && typeof e.full_name === 'string' && typeof e.created_at === 'string'
+      );
+      return { entries, loaded: true };
     }
-    if (res.length < perPage) break;
-    page += 1;
+  } catch (e) {
+    console.error('Failed to parse registry/index.json:', e);
   }
-  return all;
+  return { entries: [], loaded: true };
 }
 
 async function deleteRepo(fullName: string, token: string): Promise<boolean> {
@@ -491,17 +584,20 @@ export const handler: Handler = async (event) => {
     };
   }
 
+  // Load existing cumulative registry (used for cleanup + updated this run)
+  const registry = await readRegistryIndex(repo, token, base.branch);
+
   const epoch = Math.floor(now.getTime() / 1000);
   const random = Math.floor(100000 + Math.random() * 900000);
 
-  // Step A: create random N auto repos in parallel; each runs its full workflow
-  const numAutoRepos =
-    Math.floor(Math.random() * (MAX_AUTO_REPOS - MIN_AUTO_REPOS + 1)) + MIN_AUTO_REPOS;
-  const autoRepoActivities: RepoActivity[] = await Promise.all(
-    Array.from({ length: numAutoRepos }, async (): Promise<RepoActivity> => {
-      const suffix = `${branchTime}-${Math.floor(100000 + Math.random() * 900000)}`;
-      const repoName = `${AUTO_REPO_PREFIX}${suffix}`;
-      const created = await createAutoRepo(token, repoName, today);
+  // Step A: create N new repos in parallel; each runs its full workflow
+  const numNewRepos =
+    Math.floor(Math.random() * (MAX_NEW_REPOS_PER_RUN - MIN_NEW_REPOS_PER_RUN + 1)) +
+    MIN_NEW_REPOS_PER_RUN;
+  const repoActivities: RepoActivity[] = await Promise.all(
+    Array.from({ length: numNewRepos }, async (): Promise<RepoActivity> => {
+      const repoName = generateRepoName();
+      const created = await createNewRepo(token, repoName);
       if (!created) {
         return {
           name: repoName,
@@ -517,15 +613,7 @@ export const handler: Handler = async (event) => {
       const numIssues =
         Math.floor(Math.random() * (MAX_ISSUES_PER_REPO - MIN_ISSUES_PER_REPO + 1)) +
         MIN_ISSUES_PER_REPO;
-      const workflow = await runAutoRepoWorkflow(
-        token,
-        approver,
-        created.full_name,
-        created.default_branch,
-        `auto/${branchTime}`,
-        `Auto-generated by daily-commit ${today} ${random}\n`,
-        numIssues
-      );
+      const workflow = await runNewRepoWorkflow(token, approver, created, numIssues);
       return {
         name: created.name,
         full_name: created.full_name,
@@ -535,50 +623,62 @@ export const handler: Handler = async (event) => {
     })
   );
 
-  // Step B: weekly cleanup of older auto repos
+  // Step B: weekly cleanup of older entries in the registry
   let cleanup: { ran: boolean; checked: number; eligible: number; deleted: string[] } = {
     ran: false,
     checked: 0,
     eligible: 0,
     deleted: [],
   };
+  let remainingRegistry = registry.entries;
   if (weekday === WEEKLY_CLEANUP_WEEKDAY) {
-    const ownedAutos = await listOwnedAutoRepos(token, AUTO_REPO_PREFIX);
     const cutoffMs = now.getTime() - REPO_AGE_DAYS_BEFORE_DELETE * 24 * 60 * 60 * 1000;
-    const eligible = ownedAutos.filter((r) => new Date(r.created_at).getTime() < cutoffMs);
+    const eligible = registry.entries.filter((e) => new Date(e.created_at).getTime() < cutoffMs);
     const toDelete = eligible.filter(() => Math.random() < DELETE_PROBABILITY);
     const deletions = await Promise.all(
-      toDelete.map(async (r) => ((await deleteRepo(r.full_name, token)) ? r.full_name : null))
+      toDelete.map(async (e) => ((await deleteRepo(e.full_name, token)) ? e.full_name : null))
     );
     const deleted = deletions.filter((n): n is string => n !== null);
-    cleanup = { ran: true, checked: ownedAutos.length, eligible: eligible.length, deleted };
+    const deletedSet = new Set(deleted);
+    remainingRegistry = registry.entries.filter((e) => !deletedSet.has(e.full_name));
+    cleanup = { ran: true, checked: registry.entries.length, eligible: eligible.length, deleted };
   }
 
-  // Step C: commit daily file + tracking registry to main repo, then PR
+  // Append today's successfully-created repos to the registry
+  const updatedRegistry: RegistryEntry[] = [
+    ...remainingRegistry,
+    ...repoActivities
+      .filter((a) => a.creation_status === 'created' && a.full_name)
+      .map((a) => ({ full_name: a.full_name, name: a.name, created_at: now.toISOString() })),
+  ];
+
+  // Step C: commit daily file + per-run audit + cumulative registry to main repo, then PR
   const branchName = `daily/${branchTime}`;
-  const filePath = `daily/${branchTime}.txt`;
-  const fileContent = `${today} ${random} ${epoch}\n`;
+  const dailyPath = `daily/${branchTime}.txt`;
+  const dailyContent = `${today} ${random} ${epoch}\n`;
   const commitMsg = `Daily commit ${today} ${random}`;
-  const trackingPath = `registry/${branchTime}.json`;
-  const tracking = {
+  const auditPath = `registry/${branchTime}.json`;
+  const audit = {
     date: today,
     time: branchTime,
     weekday,
     epoch,
     random,
     approver_username: approver?.username ?? null,
-    auto_repos: autoRepoActivities,
+    repos: repoActivities,
     weekly_cleanup: cleanup,
   };
-  const trackingContent = JSON.stringify(tracking, null, 2) + '\n';
+  const auditContent = JSON.stringify(audit, null, 2) + '\n';
+  const registryContent = JSON.stringify(updatedRegistry, null, 2) + '\n';
 
   const committed = await createBranchWithFiles(
     repo,
     token,
     branchName,
     [
-      { path: filePath, content: fileContent },
-      { path: trackingPath, content: trackingContent },
+      { path: dailyPath, content: dailyContent },
+      { path: auditPath, content: auditContent },
+      { path: REGISTRY_INDEX_PATH, content: registryContent },
     ],
     commitMsg,
     base.commitSha,
@@ -587,7 +687,7 @@ export const handler: Handler = async (event) => {
   if (!committed) {
     return {
       statusCode: 500,
-      body: JSON.stringify({ error: 'Create branch or commit failed', tracking }),
+      body: JSON.stringify({ error: 'Create branch or commit failed', audit }),
     };
   }
 
@@ -595,12 +695,12 @@ export const handler: Handler = async (event) => {
     title: `Daily merge ${today} ${branchTime}`,
     head: branchName,
     base: base.branch,
-    body: `Auto PR for ${today} ${branchTime}\n\nAuto repos created: ${autoRepoActivities.length}\nWeekly cleanup ran: ${cleanup.ran}`,
+    body: `Daily run for ${today} ${branchTime}\n\nRepos created: ${repoActivities.length}\nWeekly cleanup ran: ${cleanup.ran}`,
   });
   if (prRes === null) {
     return {
       statusCode: 500,
-      body: JSON.stringify({ error: 'Create PR failed', tracking }),
+      body: JSON.stringify({ error: 'Create PR failed', audit }),
     };
   }
 
@@ -632,9 +732,10 @@ export const handler: Handler = async (event) => {
       branch: branchName,
       prCreated: true,
       mergedYesterdayCount,
-      autoReposRequested: numAutoRepos,
-      autoReposCreated: autoRepoActivities.filter((r) => r.creation_status === 'created').length,
-      autoReposApproved: autoRepoActivities.filter((r) => r.pr_approved).length,
+      reposRequested: numNewRepos,
+      reposCreated: repoActivities.filter((r) => r.creation_status === 'created').length,
+      reposApproved: repoActivities.filter((r) => r.pr_approved).length,
+      registrySize: updatedRegistry.length,
       weeklyCleanup: cleanup,
     }),
   };
