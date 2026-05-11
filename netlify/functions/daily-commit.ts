@@ -488,8 +488,9 @@ async function readRegistryIndex(repo: string, token: string, branch: string): P
   if (!res || typeof res !== 'object' || Array.isArray(res)) return { entries: [], loaded: false };
   const obj = res as { content?: string; encoding?: string };
   if (!obj.content) return { entries: [], loaded: true };
+  const decoded = Buffer.from(obj.content, (obj.encoding as BufferEncoding) || 'base64').toString('utf8');
+  if (decoded.trim() === '') return { entries: [], loaded: true };
   try {
-    const decoded = Buffer.from(obj.content, (obj.encoding as BufferEncoding) || 'base64').toString('utf8');
     const parsed = JSON.parse(decoded);
     if (Array.isArray(parsed)) {
       const entries = parsed.filter(
