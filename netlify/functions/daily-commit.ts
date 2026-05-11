@@ -38,6 +38,10 @@ const WEEKLY_CLEANUP_WEEKDAY = 'Sun';
 const REPO_AGE_DAYS_BEFORE_DELETE = 2;
 const DELETE_PROBABILITY = 0.5;
 const REGISTRY_INDEX_PATH = 'registry/index.json';
+const MERGE_NEW_PR_PROBABILITY = 0.7;
+const CLOSE_ISSUE_PROBABILITY = 0.3;
+const MAX_REPOS_FOR_ISSUE_CLEANUP_PER_RUN = 3;
+const MAX_ISSUES_TO_SCAN_PER_REPO = 10;
 
 const TECH_WORDS = [
   'api', 'sdk', 'core', 'util', 'engine', 'parser', 'runner', 'broker',
@@ -448,10 +452,13 @@ async function runNewRepoWorkflow(
             });
             prApproved = reviewRes !== null;
           }
-          const mergeRes = await githubApi(repo.full_name, ownerToken, 'PUT', `/pulls/${n}/merge`, {
-            commit_title: `${prTitle} (#${n})`,
-          });
-          prMerged = mergeRes !== null;
+          if (Math.random() < MERGE_NEW_PR_PROBABILITY) {
+            const mergeToken = approver?.token ?? ownerToken;
+            const mergeRes = await githubApi(repo.full_name, mergeToken, 'PUT', `/pulls/${n}/merge`, {
+              commit_title: `${prTitle} (#${n})`,
+            });
+            prMerged = mergeRes !== null;
+          }
         }
       }
     }
@@ -508,6 +515,55 @@ async function readRegistryIndex(repo: string, token: string, branch: string): P
 async function deleteRepo(fullName: string, token: string): Promise<boolean> {
   const res = await githubRequest(token, 'DELETE', `/repos/${fullName}`);
   return res !== null;
+}
+
+interface IssueClosure {
+  repo: string;
+  issue: number;
+}
+
+interface IssueCleanupResult {
+  checked_repos: number;
+  closed: IssueClosure[];
+}
+
+async function closeRandomIssuesInRegistry(
+  ownerToken: string,
+  approver: Approver | null,
+  entries: RegistryEntry[]
+): Promise<IssueCleanupResult> {
+  if (entries.length === 0) return { checked_repos: 0, closed: [] };
+  const shuffled = [...entries].sort(() => Math.random() - 0.5);
+  const sample = shuffled.slice(0, MAX_REPOS_FOR_ISSUE_CLEANUP_PER_RUN);
+  const closeToken = approver?.token ?? ownerToken;
+  const perRepo = await Promise.all(
+    sample.map(async (entry) => {
+      const issues = await githubApi(
+        entry.full_name,
+        ownerToken,
+        'GET',
+        `/issues?state=open&per_page=${MAX_ISSUES_TO_SCAN_PER_REPO}`
+      );
+      if (!Array.isArray(issues)) return [];
+      const candidates = issues.filter((i) => {
+        if (!i || typeof i !== 'object') return false;
+        if ((i as { pull_request?: unknown }).pull_request !== undefined) return false;
+        return Math.random() < CLOSE_ISSUE_PROBABILITY;
+      });
+      const closures = await Promise.all(
+        candidates.map(async (i) => {
+          const num = (i as { number?: number }).number;
+          if (typeof num !== 'number') return null;
+          const res = await githubApi(entry.full_name, closeToken, 'PATCH', `/issues/${num}`, {
+            state: 'closed',
+          });
+          return res !== null ? { repo: entry.full_name, issue: num } : null;
+        })
+      );
+      return closures.filter((c): c is IssueClosure => c !== null);
+    })
+  );
+  return { checked_repos: sample.length, closed: perRepo.flat() };
 }
 
 export const handler: Handler = async (event) => {
@@ -645,6 +701,9 @@ export const handler: Handler = async (event) => {
     cleanup = { ran: true, checked: registry.entries.length, eligible: eligible.length, deleted };
   }
 
+  // Step B2: randomly close some open issues across registry repos (using approver bot when available)
+  const issueCleanup = await closeRandomIssuesInRegistry(token, approver, remainingRegistry);
+
   // Append today's successfully-created repos to the registry
   const updatedRegistry: RegistryEntry[] = [
     ...remainingRegistry,
@@ -668,6 +727,7 @@ export const handler: Handler = async (event) => {
     approver_username: approver?.username ?? null,
     repos: repoActivities,
     weekly_cleanup: cleanup,
+    issue_cleanup: issueCleanup,
   };
   const auditContent = JSON.stringify(audit, null, 2) + '\n';
   const registryContent = JSON.stringify(updatedRegistry, null, 2) + '\n';
@@ -738,6 +798,7 @@ export const handler: Handler = async (event) => {
       reposApproved: repoActivities.filter((r) => r.pr_approved).length,
       registrySize: updatedRegistry.length,
       weeklyCleanup: cleanup,
+      issueCleanup,
     }),
   };
 };
