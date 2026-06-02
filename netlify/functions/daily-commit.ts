@@ -1,4 +1,12 @@
 import { Handler } from '@netlify/functions';
+import {
+  GITHUB_API,
+  REGISTRY_INDEX_PATH,
+  githubRequest,
+  githubApi,
+  RegistryEntry,
+  readRegistryIndex,
+} from '../../lib/github-registry';
 
 /**
  * Daily commit + side-repo workflow (tuned to fit Netlify's default 10s timeout).
@@ -11,15 +19,18 @@ import { Handler } from '@netlify/functions';
  *       - approver auto-accepts the invitation
  *       - commits a realistic-looking file via PR (README/notes/CHANGELOG/TODO)
  *       - approver leaves an APPROVE review
- *       - owner merges the PR
+ *       - approver bot (fallback: owner) randomly merges the PR
  *       - opens 1..MAX_ISSUES_PER_REPO issues with realistic titles (parallel)
- *  2. Each run: reads the cumulative registry from the main repo and deletes
- *     any tracked side-repo older than REPO_MAX_AGE_DAYS.
+ *  2. Randomly closes some open issues across registry repos (sample of
+ *     MAX_REPOS_FOR_ISSUE_CLEANUP_PER_RUN).
  *  3. Commits to GITHUB_REPO in one branch:
  *       - daily/<time>.txt        (existing daily file, unchanged format)
  *       - registry/<time>.json    (per-run audit log)
- *       - registry/index.json     (cumulative repo list for cleanup)
+ *       - registry/index.json     (cumulative repo list)
  *     Opens PR to default branch, merges yesterday's still-open PRs.
+ *
+ * Repo deletion (entries older than REPO_MAX_AGE_DAYS) is handled by a
+ * separate endpoint: netlify/functions/cleanup-repos.ts.
  *
  * Env:
  *   GITHUB_REPO            owner/repo of the main tracking repo (required)
@@ -29,13 +40,10 @@ import { Handler } from '@netlify/functions';
  *   TZ                     optional IANA tz (default UTC)
  */
 
-const GITHUB_API = 'https://api.github.com';
 const MIN_NEW_REPOS_PER_RUN = 1;
 const MAX_NEW_REPOS_PER_RUN = 3;
 const MIN_ISSUES_PER_REPO = 1;
 const MAX_ISSUES_PER_REPO = 5;
-const REPO_MAX_AGE_DAYS = 7;
-const REGISTRY_INDEX_PATH = 'registry/index.json';
 const MERGE_NEW_PR_PROBABILITY = 0.7;
 const CLOSE_ISSUE_PROBABILITY = 0.3;
 const MAX_REPOS_FOR_ISSUE_CLEANUP_PER_RUN = 3;
@@ -94,8 +102,6 @@ const README_DESCRIPTIONS = [
   'Quick prototype for an idea.',
 ];
 
-type GitHubApiResult = Record<string, unknown> | Record<string, unknown>[] | null;
-
 function pickRandom<T>(arr: T[]): T {
   return arr[Math.floor(Math.random() * arr.length)];
 }
@@ -141,53 +147,6 @@ function generateFileChange(repoName: string): { path: string; content: string }
         content: `# TODO\n\n- ${pickRandom(ISSUE_TITLES)}\n- ${pickRandom(ISSUE_TITLES)}\n- ${pickRandom(ISSUE_TITLES)}\n`,
       };
   }
-}
-
-async function githubRequest(
-  token: string,
-  method: string,
-  fullPath: string,
-  body?: unknown
-): Promise<GitHubApiResult> {
-  const url = `${GITHUB_API}${fullPath}`;
-  const headers: Record<string, string> = {
-    Accept: 'application/vnd.github+json',
-    Authorization: `Bearer ${token}`,
-    'User-Agent': 'daily-commit-netlify',
-  };
-  if (body !== undefined && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
-    headers['Content-Type'] = 'application/json';
-  }
-  const res = await fetch(url, {
-    method,
-    headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
-  if (res.status >= 400) {
-    const text = await res.text();
-    console.error(`GitHub API ${method} ${fullPath}: ${res.status} ${text}`);
-    return null;
-  }
-  if (res.status === 204 || res.headers.get('content-length') === '0') {
-    return {};
-  }
-  const raw = await res.text();
-  if (!raw) return {};
-  try {
-    return JSON.parse(raw) as GitHubApiResult;
-  } catch {
-    return null;
-  }
-}
-
-async function githubApi(
-  repo: string,
-  token: string,
-  method: string,
-  path: string,
-  body?: unknown
-): Promise<GitHubApiResult> {
-  return githubRequest(token, method, `/repos/${repo}${path}`, body);
 }
 
 async function getDefaultBranchAndLatestCommit(
@@ -477,44 +436,6 @@ async function runNewRepoWorkflow(
   return { collaborator_status: collaboratorStatus, pr_number: prNumber, pr_approved: prApproved, pr_merged: prMerged, issues };
 }
 
-interface RegistryEntry {
-  full_name: string;
-  name: string;
-  created_at: string;
-}
-
-interface RegistryRead {
-  entries: RegistryEntry[];
-  loaded: boolean;
-}
-
-async function readRegistryIndex(repo: string, token: string, branch: string): Promise<RegistryRead> {
-  const res = await githubApi(repo, token, 'GET', `/contents/${REGISTRY_INDEX_PATH}?ref=${encodeURIComponent(branch)}`);
-  if (!res || typeof res !== 'object' || Array.isArray(res)) return { entries: [], loaded: false };
-  const obj = res as { content?: string; encoding?: string };
-  if (!obj.content) return { entries: [], loaded: true };
-  const decoded = Buffer.from(obj.content, (obj.encoding as BufferEncoding) || 'base64').toString('utf8');
-  if (decoded.trim() === '') return { entries: [], loaded: true };
-  try {
-    const parsed = JSON.parse(decoded);
-    if (Array.isArray(parsed)) {
-      const entries = parsed.filter(
-        (e): e is RegistryEntry =>
-          e && typeof e === 'object' && typeof e.full_name === 'string' && typeof e.created_at === 'string'
-      );
-      return { entries, loaded: true };
-    }
-  } catch (e) {
-    console.error('Failed to parse registry/index.json:', e);
-  }
-  return { entries: [], loaded: true };
-}
-
-async function deleteRepo(fullName: string, token: string): Promise<boolean> {
-  const res = await githubRequest(token, 'DELETE', `/repos/${fullName}`);
-  return res !== null;
-}
-
 interface IssueClosure {
   repo: string;
   issue: number;
@@ -678,23 +599,13 @@ export const handler: Handler = async (event) => {
     })
   );
 
-  // Step B: daily cleanup — delete any registry entry older than REPO_MAX_AGE_DAYS
-  const cutoffMs = now.getTime() - REPO_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
-  const eligible = registry.entries.filter((e) => new Date(e.created_at).getTime() < cutoffMs);
-  const deletions = await Promise.all(
-    eligible.map(async (e) => ((await deleteRepo(e.full_name, token)) ? e.full_name : null))
-  );
-  const deleted = deletions.filter((n): n is string => n !== null);
-  const deletedSet = new Set(deleted);
-  const remainingRegistry = registry.entries.filter((e) => !deletedSet.has(e.full_name));
-  const cleanup = { checked: registry.entries.length, eligible: eligible.length, deleted };
-
-  // Step B2: randomly close some open issues across registry repos (using approver bot when available)
-  const issueCleanup = await closeRandomIssuesInRegistry(token, approver, remainingRegistry);
+  // Step B: randomly close some open issues across registry repos (using approver bot when available)
+  // Repo deletion (entries older than REPO_MAX_AGE_DAYS) is handled by cleanup-repos.ts.
+  const issueCleanup = await closeRandomIssuesInRegistry(token, approver, registry.entries);
 
   // Append today's successfully-created repos to the registry
   const updatedRegistry: RegistryEntry[] = [
-    ...remainingRegistry,
+    ...registry.entries,
     ...repoActivities
       .filter((a) => a.creation_status === 'created' && a.full_name)
       .map((a) => ({ full_name: a.full_name, name: a.name, created_at: now.toISOString() })),
@@ -714,7 +625,6 @@ export const handler: Handler = async (event) => {
     random,
     approver_username: approver?.username ?? null,
     repos: repoActivities,
-    weekly_cleanup: cleanup,
     issue_cleanup: issueCleanup,
   };
   const auditContent = JSON.stringify(audit, null, 2) + '\n';
@@ -744,7 +654,7 @@ export const handler: Handler = async (event) => {
     title: `Daily merge ${today} ${branchTime}`,
     head: branchName,
     base: base.branch,
-    body: `Daily run for ${today} ${branchTime}\n\nRepos created: ${repoActivities.length}\nRepos deleted (older than ${REPO_MAX_AGE_DAYS}d): ${cleanup.deleted.length}`,
+    body: `Daily run for ${today} ${branchTime}\n\nRepos created: ${repoActivities.length}`,
   });
   if (prRes === null) {
     return {
@@ -785,7 +695,6 @@ export const handler: Handler = async (event) => {
       reposCreated: repoActivities.filter((r) => r.creation_status === 'created').length,
       reposApproved: repoActivities.filter((r) => r.pr_approved).length,
       registrySize: updatedRegistry.length,
-      weeklyCleanup: cleanup,
       issueCleanup,
     }),
   };
