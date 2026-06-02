@@ -13,8 +13,8 @@ import { Handler } from '@netlify/functions';
  *       - approver leaves an APPROVE review
  *       - owner merges the PR
  *       - opens 1..MAX_ISSUES_PER_REPO issues with realistic titles (parallel)
- *  2. On WEEKLY_CLEANUP_WEEKDAY (in TZ): reads the cumulative registry from
- *     the main repo, picks entries older than 2 days, randomly deletes ~half.
+ *  2. Each run: reads the cumulative registry from the main repo and deletes
+ *     any tracked side-repo older than REPO_MAX_AGE_DAYS.
  *  3. Commits to GITHUB_REPO in one branch:
  *       - daily/<time>.txt        (existing daily file, unchanged format)
  *       - registry/<time>.json    (per-run audit log)
@@ -34,9 +34,7 @@ const MIN_NEW_REPOS_PER_RUN = 1;
 const MAX_NEW_REPOS_PER_RUN = 3;
 const MIN_ISSUES_PER_REPO = 1;
 const MAX_ISSUES_PER_REPO = 5;
-const WEEKLY_CLEANUP_WEEKDAY = 'Sun';
-const REPO_AGE_DAYS_BEFORE_DELETE = 2;
-const DELETE_PROBABILITY = 0.5;
+const REPO_MAX_AGE_DAYS = 7;
 const REGISTRY_INDEX_PATH = 'registry/index.json';
 const MERGE_NEW_PR_PROBABILITY = 0.7;
 const CLOSE_ISSUE_PROBABILITY = 0.3;
@@ -680,26 +678,16 @@ export const handler: Handler = async (event) => {
     })
   );
 
-  // Step B: weekly cleanup of older entries in the registry
-  let cleanup: { ran: boolean; checked: number; eligible: number; deleted: string[] } = {
-    ran: false,
-    checked: 0,
-    eligible: 0,
-    deleted: [],
-  };
-  let remainingRegistry = registry.entries;
-  if (weekday === WEEKLY_CLEANUP_WEEKDAY) {
-    const cutoffMs = now.getTime() - REPO_AGE_DAYS_BEFORE_DELETE * 24 * 60 * 60 * 1000;
-    const eligible = registry.entries.filter((e) => new Date(e.created_at).getTime() < cutoffMs);
-    const toDelete = eligible.filter(() => Math.random() < DELETE_PROBABILITY);
-    const deletions = await Promise.all(
-      toDelete.map(async (e) => ((await deleteRepo(e.full_name, token)) ? e.full_name : null))
-    );
-    const deleted = deletions.filter((n): n is string => n !== null);
-    const deletedSet = new Set(deleted);
-    remainingRegistry = registry.entries.filter((e) => !deletedSet.has(e.full_name));
-    cleanup = { ran: true, checked: registry.entries.length, eligible: eligible.length, deleted };
-  }
+  // Step B: daily cleanup — delete any registry entry older than REPO_MAX_AGE_DAYS
+  const cutoffMs = now.getTime() - REPO_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
+  const eligible = registry.entries.filter((e) => new Date(e.created_at).getTime() < cutoffMs);
+  const deletions = await Promise.all(
+    eligible.map(async (e) => ((await deleteRepo(e.full_name, token)) ? e.full_name : null))
+  );
+  const deleted = deletions.filter((n): n is string => n !== null);
+  const deletedSet = new Set(deleted);
+  const remainingRegistry = registry.entries.filter((e) => !deletedSet.has(e.full_name));
+  const cleanup = { checked: registry.entries.length, eligible: eligible.length, deleted };
 
   // Step B2: randomly close some open issues across registry repos (using approver bot when available)
   const issueCleanup = await closeRandomIssuesInRegistry(token, approver, remainingRegistry);
@@ -756,7 +744,7 @@ export const handler: Handler = async (event) => {
     title: `Daily merge ${today} ${branchTime}`,
     head: branchName,
     base: base.branch,
-    body: `Daily run for ${today} ${branchTime}\n\nRepos created: ${repoActivities.length}\nWeekly cleanup ran: ${cleanup.ran}`,
+    body: `Daily run for ${today} ${branchTime}\n\nRepos created: ${repoActivities.length}\nRepos deleted (older than ${REPO_MAX_AGE_DAYS}d): ${cleanup.deleted.length}`,
   });
   if (prRes === null) {
     return {
